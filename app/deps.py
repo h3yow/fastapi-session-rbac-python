@@ -44,11 +44,14 @@ def require_permission(permission: str):
         roles = user.roles if user else frozenset()
         if not roles:
             raise ForbiddenError(ErrorCode.FORBIDDEN_ROLE, "account has no roles")
-        if not policy.has_permission(roles, permission):
+        decision = policy.explain(roles, permission)
+        if not decision.allowed:
             raise ForbiddenError(
                 ErrorCode.FORBIDDEN_PERMISSION,
                 f"permission '{permission}' not granted to roles "
-                f"{sorted(roles)} (policy v{policy.version})",
+                f"{sorted(roles)} (policy v{decision.version}, "
+                f"reason={decision.reason})",
+                reason=decision.reason,
             )
         return session
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 
 from .config import Settings
 from .models import LockoutState, Session, User
@@ -46,7 +47,10 @@ class SessionStore:
 
     def get(self, session_id: str) -> Session | None:
         with self._lock:
-            return self._sessions.get(session_id)
+            session = self._sessions.get(session_id)
+            # Return an immutable snapshot taken under the lock so callers
+            # never observe a session mutating mid-decision (linearizability).
+            return replace(session) if session is not None else None
 
     def revoke(self, session_id: str) -> bool:
         """Revoke one session independently of the account's other sessions."""
@@ -56,6 +60,27 @@ class SessionStore:
                 return False
             session.revoked = True
             return True
+
+    def revoke_once(self, session_id: str) -> str:
+        """Idempotent, distinguishable single-session revocation.
+
+        Returns:
+            ``"unknown"``         - no session with this id ever existed
+            ``"already_revoked"`` - it existed but was already dead
+            ``"revoked"``         - this call flipped it from live to dead
+
+        The lookup and the state flip happen under one lock, so a revoke
+        racing with a request is linearized: the request either completes
+        against the pre-revoke state or is rejected afterwards, never both.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return "unknown"
+            if session.revoked:
+                return "already_revoked"
+            session.revoked = True
+            return "revoked"
 
     def revoke_all_for_user(self, username: str) -> int:
         with self._lock:
@@ -68,7 +93,19 @@ class SessionStore:
 
     def sessions_for_user(self, username: str) -> list[Session]:
         with self._lock:
-            return [s for s in self._sessions.values() if s.username == username]
+            # Snapshots under the lock.
+            return [replace(s) for s in self._sessions.values() if s.username == username]
+
+    def update_session(self, session_id: str, **changes) -> Session | None:
+        """Apply field changes to a stored session atomically; returns a
+        snapshot of the updated row (or None if the id is unknown)."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            for key, value in changes.items():
+                setattr(session, key, value)
+            return replace(session)
 
 
 class LockoutStore:
