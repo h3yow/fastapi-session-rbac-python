@@ -3,6 +3,17 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import StrEnum
+
+
+class RevokeReason(StrEnum):
+    """Why a session was (or would be) invalidated.
+
+    Kept distinct so clients can tell *why* a session stopped working:
+    deliberately revoked, or invalidated wholesale by a password change.
+    """
+    REVOKED = "revoked"                    # targeted revocation / logout
+    PASSWORD_CHANGED = "password_changed"  # bulk invalidation on password change
 
 
 @dataclass
@@ -25,6 +36,9 @@ class Session:
     csrf_expires_at: float
     password_generation: int  # generation at login time
     revoked: bool = False
+    # Set when revoked; distinguishes targeted revocation from the
+    # password-change bulk invalidation.
+    revoked_reason: RevokeReason | None = None
 
     def is_expired(self, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else now

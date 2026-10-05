@@ -8,9 +8,19 @@ from __future__ import annotations
 
 import threading
 import time
+from enum import StrEnum
 
 from .config import Settings
-from .models import LockoutState, Session, User
+from .models import LockoutState, RevokeReason, Session, User
+
+
+class RevokeOutcome(StrEnum):
+    """Result of a targeted session revocation (deterministic and
+    reproducible: the same call on the same state always yields the
+    same outcome)."""
+    REVOKED = "revoked"                    # was live, now revoked
+    NOT_FOUND = "not_found"                # no such session id
+    ALREADY_REVOKED = "already_revoked"    # exists but was already revoked
 
 
 class UserStore:
@@ -48,21 +58,38 @@ class SessionStore:
         with self._lock:
             return self._sessions.get(session_id)
 
-    def revoke(self, session_id: str) -> bool:
-        """Revoke one session independently of the account's other sessions."""
+    def revoke(
+        self,
+        session_id: str,
+        reason: RevokeReason = RevokeReason.REVOKED,
+    ) -> RevokeOutcome:
+        """Revoke one session independently of the account's other sessions.
+
+        The check-and-set happens under the store lock, so a concurrent
+        ``get`` either observes the session live (request proceeds) or
+        revoked (request rejected) — never a torn state.
+        """
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
-                return False
+                return RevokeOutcome.NOT_FOUND
+            if session.revoked:
+                return RevokeOutcome.ALREADY_REVOKED
             session.revoked = True
-            return True
+            session.revoked_reason = reason
+            return RevokeOutcome.REVOKED
 
-    def revoke_all_for_user(self, username: str) -> int:
+    def revoke_all_for_user(
+        self,
+        username: str,
+        reason: RevokeReason = RevokeReason.PASSWORD_CHANGED,
+    ) -> int:
         with self._lock:
             count = 0
             for session in self._sessions.values():
                 if session.username == username and not session.revoked:
                     session.revoked = True
+                    session.revoked_reason = reason
                     count += 1
             return count
 

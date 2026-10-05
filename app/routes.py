@@ -10,8 +10,15 @@ from pydantic import BaseModel
 from .auth import AuthService
 from .config import DEFAULT_SETTINGS, Settings
 from .csrf import CSRF_HEADER, validate_csrf
-from .deps import get_auth_service, get_current_session, require_permission
-from .errors import AuthError, CsrfError, ForbiddenError
+from .deps import get_auth_service, get_current_session, get_policy_engine, require_permission
+from .errors import (
+    AuthError,
+    ConflictError,
+    CsrfError,
+    ErrorCode,
+    ForbiddenError,
+    NotFoundError,
+)
 from .models import Session
 from .rbac import PolicyEngine
 from .security import hash_password
@@ -23,7 +30,13 @@ SESSION_COOKIE = "session_id"
 DEFAULT_ROLES: dict[str, set[str]] = {
     "reader": {"reports:read"},
     "editor": {"reports:read", "reports:write"},
-    "admin": {"reports:read", "reports:write", "admin:users"},
+    "admin": {
+        "reports:read",
+        "reports:write",
+        "admin:users",
+        "admin:policy",    # runtime role/permission management
+        "admin:sessions",  # session inspection & targeted revocation
+    },
 }
 
 
@@ -35,6 +48,11 @@ class LoginRequest(BaseModel):
 class PasswordChangeRequest(BaseModel):
     old_password: str
     new_password: str
+
+
+class PolicyChangeRequest(BaseModel):
+    role: str
+    permission: str
 
 
 def _session_payload(session: Session) -> dict:
@@ -77,6 +95,20 @@ def create_app(
 
     @app.exception_handler(CsrfError)
     async def _csrf(_: Request, exc: CsrfError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": exc.code.value, "detail": exc.detail}},
+        )
+
+    @app.exception_handler(NotFoundError)
+    async def _not_found(_: Request, exc: NotFoundError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": exc.code.value, "detail": exc.detail}},
+        )
+
+    @app.exception_handler(ConflictError)
+    async def _conflict(_: Request, exc: ConflictError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": exc.code.value, "detail": exc.detail}},
@@ -163,6 +195,95 @@ def create_app(
         store: UserStore = request.app.state.user_store
         _ = store  # listing kept simple for the demo
         return {"actor": session.username}
+
+    # ------------------------------------------- runtime policy administration
+    @app.get("/admin/policy")
+    def get_policy(
+        session: Session = Depends(require_permission("admin:policy")),
+        policy: PolicyEngine = Depends(get_policy_engine),
+    ) -> dict:
+        return policy.snapshot()
+
+    @app.post("/admin/policy/grant")
+    def grant_permission(
+        body: PolicyChangeRequest,
+        request: Request,
+        session: Session = Depends(require_permission("admin:policy")),
+        policy: PolicyEngine = Depends(get_policy_engine),
+    ) -> dict:
+        validate_csrf(session, request.headers.get(CSRF_HEADER))
+        version = policy.grant(body.role, body.permission)
+        return {"granted": True, "role": body.role,
+                "permission": body.permission, "policy_version": version}
+
+    @app.post("/admin/policy/revoke")
+    def revoke_permission(
+        body: PolicyChangeRequest,
+        request: Request,
+        session: Session = Depends(require_permission("admin:policy")),
+        policy: PolicyEngine = Depends(get_policy_engine),
+    ) -> dict:
+        validate_csrf(session, request.headers.get(CSRF_HEADER))
+        version = policy.revoke(body.role, body.permission)
+        return {"revoked": True, "role": body.role,
+                "permission": body.permission, "policy_version": version}
+
+    # ---------------------------------------------------- session administration
+    @app.get("/sessions")
+    def list_own_sessions(
+        session: Session = Depends(get_current_session),
+        auth: AuthService = Depends(get_auth_service),
+    ) -> dict:
+        sessions = auth.list_sessions(session.username)
+        return {
+            "sessions": [
+                auth.session_view(s, current_session_id=session.session_id)
+                for s in sessions
+            ]
+        }
+
+    @app.delete("/sessions/{sid}")
+    def revoke_own_session(
+        sid: str,
+        request: Request,
+        session: Session = Depends(get_current_session),
+        auth: AuthService = Depends(get_auth_service),
+    ) -> dict:
+        validate_csrf(session, request.headers.get(CSRF_HEADER))
+        target = auth.get_session(sid)
+        # Only own sessions are addressable here; anything else is a 404
+        # so the existence of other accounts' sessions is not leaked.
+        if target is None or target.username != session.username:
+            raise NotFoundError(ErrorCode.SESSION_NOT_FOUND, "no such session")
+        auth.revoke_session(sid)
+        return {"revoked": True, "session_id": sid}
+
+    @app.get("/admin/users/{username}/sessions")
+    def list_user_sessions(
+        username: str,
+        session: Session = Depends(require_permission("admin:sessions")),
+        auth: AuthService = Depends(get_auth_service),
+    ) -> dict:
+        sessions = auth.list_sessions(username)
+        return {
+            "username": username,
+            "sessions": [auth.session_view(s) for s in sessions],
+        }
+
+    @app.delete("/admin/users/{username}/sessions/{sid}")
+    def revoke_user_session(
+        username: str,
+        sid: str,
+        request: Request,
+        session: Session = Depends(require_permission("admin:sessions")),
+        auth: AuthService = Depends(get_auth_service),
+    ) -> dict:
+        validate_csrf(session, request.headers.get(CSRF_HEADER))
+        target = auth.get_session(sid)
+        if target is None or target.username != username:
+            raise NotFoundError(ErrorCode.SESSION_NOT_FOUND, "no such session")
+        auth.revoke_session(sid)
+        return {"revoked": True, "username": username, "session_id": sid}
 
     return app
 

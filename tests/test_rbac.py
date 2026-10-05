@@ -95,6 +95,7 @@ class TestHotPolicyUpdate:
         r = client.post("/reports", headers={"X-CSRF-Token": tok})
         logger.info("policy v%d revoked editor write -> %d %s", v, r.status_code, err(r))
         assert r.status_code == 403
-        assert err(r) == "forbidden_permission"
+        # Distinguishable from "never granted": this was revoked at runtime.
+        assert err(r) == "permission_revoked"
         # Read still allowed for the same session.
         assert client.get("/reports").status_code == 200

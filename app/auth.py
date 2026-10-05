@@ -17,10 +17,10 @@ from __future__ import annotations
 import time
 
 from .config import Settings
-from .errors import AuthError, ErrorCode
-from .models import Session, User
+from .errors import AuthError, ConflictError, ErrorCode, NotFoundError
+from .models import RevokeReason, Session, User
 from .security import new_token, verify_password
-from .store import LockoutStore, SessionStore, UserStore
+from .store import LockoutStore, RevokeOutcome, SessionStore, UserStore
 
 # Verified against when the account does not exist, so timing does not
 # leak account existence. Value is a valid-format pbkdf2 hash.
@@ -91,25 +91,74 @@ class AuthService:
 
     # --------------------------------------------------------------- sessions
     def authenticate(self, session_id: str | None) -> Session:
-        """Resolve a session id to a live session or raise with a reason."""
+        """Resolve a session id to a live session or raise with a reason.
+
+        Every rejection carries a distinct code so operators can tell
+        *why* a session was rejected: never seen, deliberately revoked,
+        bulk-invalidated by a password change, or simply expired.
+        """
         if not session_id:
             raise AuthError(ErrorCode.SESSION_MISSING, "no session cookie")
         session = self._sessions.get(session_id)
-        if session is None or session.revoked:
-            raise AuthError(ErrorCode.SESSION_INVALID, "session unknown or revoked")
+        if session is None:
+            raise AuthError(ErrorCode.SESSION_UNKNOWN, "no such session")
+        if session.revoked:
+            if session.revoked_reason is RevokeReason.PASSWORD_CHANGED:
+                raise AuthError(
+                    ErrorCode.SESSION_PASSWORD_CHANGED,
+                    "session invalidated by password change",
+                )
+            raise AuthError(ErrorCode.SESSION_REVOKED, "session was revoked")
         now = time.monotonic()
         if session.is_expired(now):
             raise AuthError(ErrorCode.SESSION_EXPIRED, "session expired")
         user = self._users.get(session.username)
         if user is None or user.password_generation != session.password_generation:
             raise AuthError(
-                ErrorCode.SESSION_INVALID, "session invalidated by password change"
+                ErrorCode.SESSION_PASSWORD_CHANGED,
+                "session invalidated by password change",
             )
         return session
 
     def logout(self, session_id: str) -> bool:
         """Revoke exactly this session; sibling sessions stay valid."""
-        return self._sessions.revoke(session_id)
+        return self._sessions.revoke(session_id) is RevokeOutcome.REVOKED
+
+    def revoke_session(self, session_id: str) -> None:
+        """Targeted administrative revocation of a single session.
+
+        Deterministic for every target state: unknown ids and already
+        revoked sessions raise distinct, reproducible errors instead of
+        silently "succeeding".
+        """
+        outcome = self._sessions.revoke(session_id)
+        if outcome is RevokeOutcome.NOT_FOUND:
+            raise NotFoundError(ErrorCode.SESSION_NOT_FOUND, "no such session")
+        if outcome is RevokeOutcome.ALREADY_REVOKED:
+            raise ConflictError(
+                ErrorCode.SESSION_ALREADY_REVOKED, "session was already revoked"
+            )
+
+    def list_sessions(self, username: str) -> list[Session]:
+        """Live (not revoked, not expired) sessions of one account."""
+        now = time.monotonic()
+        return [
+            s
+            for s in self._sessions.sessions_for_user(username)
+            if not s.revoked and not s.is_expired(now)
+        ]
+
+    @staticmethod
+    def session_view(session: Session, current_session_id: str | None = None) -> dict:
+        """Serializable, clock-relative description of one session."""
+        now = time.monotonic()
+        return {
+            "session_id": session.session_id,
+            "username": session.username,
+            "age_seconds": round(now - session.created_at, 3),
+            "expires_in_seconds": round(session.expires_at - now, 3),
+            "is_current": session.session_id == current_session_id,
+        }
 
     def refresh(self, session_id: str) -> Session:
         """Extend a live session's expiry (and re-issue its CSRF token).
@@ -150,3 +199,7 @@ class AuthService:
     # ------------------------------------------------------------------ users
     def get_user(self, username: str) -> User | None:
         return self._users.get(username)
+
+    def get_session(self, session_id: str) -> Session | None:
+        """Raw lookup (any state) for ownership checks before revocation."""
+        return self._sessions.get(session_id)

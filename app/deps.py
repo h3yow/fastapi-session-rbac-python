@@ -8,7 +8,7 @@ from fastapi import Cookie, Depends, Request
 from .auth import AuthService
 from .errors import ForbiddenError, ErrorCode
 from .models import Session
-from .rbac import PolicyEngine
+from .rbac import DenialReason, PolicyEngine
 
 
 def get_auth_service(request: Request) -> AuthService:
@@ -31,8 +31,9 @@ def require_permission(permission: str):
     """Dependency factory enforcing a permission under the *current* policy.
 
     The policy is read at request time, so permission changes apply to
-    subsequent requests without a restart. Denials distinguish "role not
-    held" from "permission not granted (or revoked)".
+    subsequent requests without a restart. Denials distinguish three
+    cases: the account holds no roles, the role never had the permission,
+    or the permission was revoked at runtime.
     """
 
     def checker(
@@ -42,14 +43,21 @@ def require_permission(permission: str):
     ) -> Session:
         user = auth.get_user(session.username)
         roles = user.roles if user else frozenset()
-        if not roles:
+        if policy.has_permission(roles, permission):
+            return session
+        reason = policy.classify_denial(roles, permission)
+        if reason is DenialReason.NO_ROLE:
             raise ForbiddenError(ErrorCode.FORBIDDEN_ROLE, "account has no roles")
-        if not policy.has_permission(roles, permission):
+        if reason is DenialReason.REVOKED_RUNTIME:
             raise ForbiddenError(
-                ErrorCode.FORBIDDEN_PERMISSION,
-                f"permission '{permission}' not granted to roles "
-                f"{sorted(roles)} (policy v{policy.version})",
+                ErrorCode.PERMISSION_REVOKED,
+                f"permission '{permission}' was revoked from roles "
+                f"{sorted(roles)} at runtime (policy v{policy.version})",
             )
-        return session
+        raise ForbiddenError(
+            ErrorCode.FORBIDDEN_PERMISSION,
+            f"permission '{permission}' not granted to roles "
+            f"{sorted(roles)} (policy v{policy.version})",
+        )
 
     return checker

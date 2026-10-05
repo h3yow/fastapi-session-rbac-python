@@ -114,7 +114,7 @@ class TestConcurrentSessionInvalidation:
         result_codes = codes(responses)
         logger.info("post-change /me codes: %s",
                     {c: result_codes.count(c) for c in set(result_codes)})
-        assert all(c == "session_invalid" for c in result_codes)
+        assert all(c == "session_password_changed" for c in result_codes)
 
     def test_revocation_is_independent_under_concurrency(self):
         client = make_client()
@@ -137,9 +137,97 @@ class TestConcurrentSessionInvalidation:
             code = resp.json().get("error", {}).get("code", "ok")
             logger.info("session ...%s -> %s", sid[-6:], code)
             if sid == victim:
-                assert resp.status_code == 401 and code == "session_invalid"
+                assert resp.status_code == 401 and code == "session_revoked"
             else:
                 assert resp.status_code == 200 and code == "ok"
+
+
+class TestConcurrentTargetedRevocation:
+    def test_revoke_racing_requests_has_deterministic_outcome(self):
+        """A request racing a revocation either completes before the revoke
+        (200) or is rejected after it (401 session_revoked) — never a torn
+        state, and never "revoked but still usable"."""
+        client = make_client()
+        logins = run_parallel(
+            lambda _: client.post(
+                "/login", json={"username": "carol", "password": "carol-password"}),
+            range(4),
+        )
+        victim = logins[0].json()["session_id"]
+        victim_tok = logins[0].json()["csrf_token"]
+        siblings = [l.json()["session_id"] for l in logins[1:]]
+
+        # Fire a burst of victim requests while revoking concurrently.
+        def request_then_revoke(i):
+            if i == 0:
+                return client.delete(
+                    f"/sessions/{victim}",
+                    headers={"X-CSRF-Token": victim_tok},
+                    cookies={"session_id": victim},
+                )
+            return client.get("/me", cookies={"session_id": victim})
+
+        responses = run_parallel(request_then_revoke, range(25))
+        revoke_resp, request_resps = responses[0], responses[1:]
+        assert revoke_resp.status_code == 200
+        outcomes = []
+        for r in request_resps:
+            code = r.json().get("error", {}).get("code", "ok")
+            outcomes.append(code)
+        logger.info("race outcomes: %s",
+                    {c: outcomes.count(c) for c in set(outcomes)})
+        # Every racing request resolved deterministically one way or the other.
+        assert set(outcomes) <= {"ok", "session_revoked"}
+        for r, code in zip(request_resps, outcomes):
+            if code == "ok":
+                assert r.status_code == 200
+            else:
+                assert r.status_code == 401
+
+        # After the revoke has completed, the victim is always rejected.
+        afterwards = run_parallel(
+            lambda _: client.get("/me", cookies={"session_id": victim}), range(10))
+        after_codes = codes(afterwards)
+        logger.info("post-revoke codes: %s", set(after_codes))
+        assert all(c == "session_revoked" for c in after_codes)
+
+        # Sibling sessions were never affected.
+        for sid in siblings:
+            r = client.get("/me", cookies={"session_id": sid})
+            assert r.status_code == 200
+
+    def test_concurrent_revokes_of_same_session_agree_on_outcome(self):
+        """Exactly one of many concurrent revokes wins; the rest get the
+        reproducible already-revoked conflict."""
+        client = make_client()
+        logins = run_parallel(
+            lambda _: client.post(
+                "/login", json={"username": "carol", "password": "carol-password"}),
+            range(2),
+        )
+        # Revoke session B while authenticated as session A (which stays
+        # alive), so only the revocation outcome itself is under test.
+        actor_sid = logins[0].json()["session_id"]
+        actor_tok = logins[0].json()["csrf_token"]
+        victim = logins[1].json()["session_id"]
+
+        responses = run_parallel(
+            lambda _: client.delete(
+                f"/sessions/{victim}",
+                headers={"X-CSRF-Token": actor_tok},
+                cookies={"session_id": actor_sid},
+            ),
+            range(12),
+        )
+        statuses = [r.status_code for r in responses]
+        logger.info("concurrent revoke statuses: %s",
+                    {s: statuses.count(s) for s in set(statuses)})
+        assert statuses.count(200) == 1
+        assert all(s == 409 for s in statuses if s != 200)
+        assert all(
+            r.json()["error"]["code"] == "session_already_revoked"
+            for r in responses if r.status_code == 409
+        )
 
 
 class TestConcurrentCsrfMisuse:

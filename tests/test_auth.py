@@ -68,7 +68,7 @@ class TestSessionLifecycle:
         # Present the revoked cookie explicitly to observe the invalid reason.
         r_me1, r_me2 = c1.get("/me", cookies={"session_id": sid1}), c2.get("/me")
         logger.info("after logout: s1 -> %s, s2 -> %d", err(r_me1), r_me2.status_code)
-        assert err(r_me1) == "session_invalid"
+        assert err(r_me1) == "session_revoked"
         assert r_me2.status_code == 200  # sibling session unaffected
 
     def test_session_expiry(self, client, settings, fake_clock, alice_client):
@@ -113,7 +113,7 @@ class TestSessionLifecycle:
         assert r.json()["sessions_revoked"] == 2
         r1, r2 = c1.get("/me"), c2.get("/me")
         logger.info("old sessions -> %s / %s", err(r1), err(r2))
-        assert err(r1) == err(r2) == "session_invalid"
+        assert err(r1) == err(r2) == "session_password_changed"
         # New password works, old one does not.
         assert login(client, "bob", "bob-new").status_code == 200
         assert err(login(client, "bob", "bob-password")) == "invalid_credentials"
